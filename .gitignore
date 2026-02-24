@@ -1,0 +1,28 @@
+# Binaries
+bin/
+build/
+/relay-agent
+*.exe
+
+# Config with secrets
+config/config.yaml
+
+# Logs
+logs/
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+vendor/
+
+# Credentials (contains passwords)
+credentials/

@@ -1,0 +1,42 @@
+# Relay Agent Configuration File
+
+# HTTP Server configuration
+server:
+  host: "0.0.0.0"
+  port: 8080
+
+# MongoDB connection settings (Replica Set required for Change Streams)
+mongodb:
+  uri: "mongodb://localhost:27017/?replicaSet=rs0"
+  database: "relay_logs"
+
+# Mail Gateway integration
+mailgateway:
+  relay_server_id: 1
+
+# Postfix log monitoring
+postfix:
+  log_file: "/var/log/mail.log"
+
+# SMTP settings
+smtp:
+  domain: "smtp.example.com"
+  api_secret: "your-secure-api-secret-min-16-chars"
+
+# SMTP Filter settings
+filter:
+  enabled: true
+  listen_addr: "0.0.0.0:10025"
+  next_hop: "127.0.0.1:10026"
+  hostname: "localhost"
+
+# Processing pipeline settings
+processing:
+  batch_size: 100
+  flush_interval: 5
+  channel_buffer: 1000
+
+# Application logging
+logging:
+  level: "info"
+  file: "/opt/relay-agent/logs/agent.log"
