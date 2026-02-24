@@ -1,4 +1,0 @@
-# MongoDB Change Stream için gerekli paketler
-motor>=3.3.0          # Async MongoDB driver
-pymongo>=4.6.0        # MongoDB driver (motor bağımlılığı)
-asyncpg>=0.29.0       # Async PostgreSQL driver
