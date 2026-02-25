@@ -1,4 +1,7 @@
 #!/bin/bash
+# Wrap in function so bash reads entire script before executing.
+# This is required for curl|bash to work (prevents read from consuming script lines).
+_main() {
 set -e
 
 # Colors
@@ -148,17 +151,10 @@ if validate_domain "$DETECTED_HOSTNAME"; then
     DEFAULT_PROMPT=" [${DETECTED_HOSTNAME}]"
 fi
 
-# Support curl|bash: read from /dev/tty when stdin is a pipe
-if [ -c /dev/tty ]; then
-    READ_FROM="/dev/tty"
-else
-    READ_FROM="/dev/stdin"
-fi
-
 while true; do
     echo -e "${YELLOW}Enter the fully qualified domain name (FQDN) for this server${DEFAULT_PROMPT}:${NC}"
     echo -e "${YELLOW}  Example: mail.example.com${NC}"
-    read -r DOMAIN_INPUT < "$READ_FROM" || DOMAIN_INPUT=""
+    read -r DOMAIN_INPUT < /dev/tty || DOMAIN_INPUT=""
 
     # Use default if empty and default is valid
     if [ -z "$DOMAIN_INPUT" ] && [ -n "$DEFAULT_PROMPT" ]; then
@@ -477,11 +473,11 @@ LE_EMAIL=""
 if [ -n "${RELAY_LETSENCRYPT_EMAIL:-}" ]; then
     LE_EMAIL="${RELAY_LETSENCRYPT_EMAIL}"
     log_info "Let's Encrypt email: ${LE_EMAIL}"
-elif [ -c /dev/tty ]; then
+elif [ -t 0 ] || [ -c /dev/tty ]; then
     # Interactive mode - ask user (works with both ./install.sh and curl|bash)
     echo ""
     echo -e "${YELLOW}Let's Encrypt email adresi (opsiyonel, bos birakabilirsiniz):${NC}"
-    read -r LE_EMAIL_INPUT < "$READ_FROM" || LE_EMAIL_INPUT=""
+    read -r LE_EMAIL_INPUT < /dev/tty || LE_EMAIL_INPUT=""
     if [ -n "${LE_EMAIL_INPUT}" ]; then
         LE_EMAIL="${LE_EMAIL_INPUT}"
     fi
@@ -1016,3 +1012,5 @@ echo "  ${INSTALL_DIR}/setup-mailgateway-access.sh --create <isim> # Yeni muster
 echo "  ${INSTALL_DIR}/setup-mailgateway-access.sh --list          # Kullanicilari listele"
 echo "  ${INSTALL_DIR}/setup-mailgateway-access.sh --delete <isim> # Kullanici sil"
 echo ""
+}
+_main "$@"
