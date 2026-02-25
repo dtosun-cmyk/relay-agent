@@ -30,9 +30,10 @@ if [ -z "$NEW_IP" ]; then
     exit 1
 fi
 
-# Get old IP from credentials file
+# Get old IP from MongoDB config (more reliable than credentials file)
 OLD_IP=""
-if [ -f "$CRED_FILE" ]; then
+OLD_IP=$(grep "bindIp:" /etc/mongod.conf 2>/dev/null | sed 's/.*bindIp:[[:space:]]*//' | tr ',' '\n' | grep -v '127.0.0.1' | head -1)
+if [ -z "$OLD_IP" ] && [ -f "$CRED_FILE" ]; then
     OLD_IP=$(grep "Server IP:" "$CRED_FILE" | head -1 | awk '{print $NF}')
 fi
 
@@ -55,7 +56,7 @@ fi
 # Extract MongoDB admin password
 MONGO_ADMIN_PASS=""
 if [ -f "$CRED_FILE" ]; then
-    MONGO_ADMIN_PASS=$(grep -A2 "^MONGODB ADMIN:" "$CRED_FILE" | grep "Password:" | awk '{print $NF}')
+    MONGO_ADMIN_PASS=$(grep -A5 "^MONGODB ADMIN:" "$CRED_FILE" | grep "^Password:" | sed 's/^Password:[[:space:]]*//')
 fi
 
 if [ -z "$MONGO_ADMIN_PASS" ]; then
@@ -104,14 +105,19 @@ done
 #######################################
 log_info "[2/4] MongoDB Replica Set guncelleniyor..."
 
-mongosh "mongodb://admin:${MONGO_ADMIN_PASS}@localhost:27017/admin?authSource=admin&directConnection=true" --quiet --eval "
+if ! mongosh "mongodb://admin:${MONGO_ADMIN_PASS}@localhost:27017/admin?authSource=admin&directConnection=true" --quiet --eval "
 var cfg = rs.conf();
 var oldHost = cfg.members[0].host;
 cfg.members[0].host = '${NEW_IP}:27017';
 cfg.version = cfg.version + 1;
 rs.reconfig(cfg, {force: true});
 print('Replica Set: ' + oldHost + ' -> ${NEW_IP}:27017');
-"
+"; then
+    log_error "Replica Set guncellenemedi! MongoDB admin sifresi yanlis olabilir."
+    log_error "Credential dosyasi: ${CRED_FILE}"
+    log_error "Manuel deneyin: mongosh 'mongodb://admin:SIFRE@localhost:27017/admin?authSource=admin&directConnection=true'"
+    exit 1
+fi
 
 # Wait for primary
 log_info "  PRIMARY bekleniyor..."
