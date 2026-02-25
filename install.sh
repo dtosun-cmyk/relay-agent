@@ -148,10 +148,17 @@ if validate_domain "$DETECTED_HOSTNAME"; then
     DEFAULT_PROMPT=" [${DETECTED_HOSTNAME}]"
 fi
 
+# Support curl|bash: read from /dev/tty when stdin is a pipe
+if [ -c /dev/tty ]; then
+    READ_FROM="/dev/tty"
+else
+    READ_FROM="/dev/stdin"
+fi
+
 while true; do
     echo -e "${YELLOW}Enter the fully qualified domain name (FQDN) for this server${DEFAULT_PROMPT}:${NC}"
     echo -e "${YELLOW}  Example: mail.example.com${NC}"
-    read -er DOMAIN_INPUT
+    read -r DOMAIN_INPUT < "$READ_FROM" || DOMAIN_INPUT=""
 
     # Use default if empty and default is valid
     if [ -z "$DOMAIN_INPUT" ] && [ -n "$DEFAULT_PROMPT" ]; then
@@ -470,11 +477,11 @@ LE_EMAIL=""
 if [ -n "${RELAY_LETSENCRYPT_EMAIL:-}" ]; then
     LE_EMAIL="${RELAY_LETSENCRYPT_EMAIL}"
     log_info "Let's Encrypt email: ${LE_EMAIL}"
-elif [ -t 0 ]; then
-    # Interactive mode - ask user
+elif [ -c /dev/tty ]; then
+    # Interactive mode - ask user (works with both ./install.sh and curl|bash)
     echo ""
     echo -e "${YELLOW}Let's Encrypt email adresi (opsiyonel, bos birakabilirsiniz):${NC}"
-    read -er LE_EMAIL_INPUT
+    read -r LE_EMAIL_INPUT < "$READ_FROM" || LE_EMAIL_INPUT=""
     if [ -n "${LE_EMAIL_INPUT}" ]; then
         LE_EMAIL="${LE_EMAIL_INPUT}"
     fi
@@ -639,6 +646,10 @@ postconf -e "smtpd_tls_protocols = !SSLv2, !SSLv3, !TLSv1, !TLSv1.1"
 # Outbound delivery - standard port 25 to destination MX
 postconf -e "relayhost ="
 postconf -e "smtp_tls_security_level = may"
+
+# XFORWARD: pass original client info (IP, hostname) to content_filter (relay-agent)
+postconf -e "smtp_send_xforward_command = yes"
+postconf -e "smtpd_authorized_xforward_hosts = 127.0.0.0/8"
 
 #--- master.cf Configuration ---
 log_info "Postfix master.cf yapilandiriliyor..."
