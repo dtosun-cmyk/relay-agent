@@ -151,27 +151,51 @@ if validate_domain "$DETECTED_HOSTNAME"; then
     DEFAULT_PROMPT=" [${DETECTED_HOSTNAME}]"
 fi
 
-while true; do
-    echo -e "${YELLOW}Enter the fully qualified domain name (FQDN) for this server${DEFAULT_PROMPT}:${NC}"
-    echo -e "${YELLOW}  Example: mail.example.com${NC}"
-    read -r DOMAIN_INPUT < /dev/tty || DOMAIN_INPUT=""
-
-    # Use default if empty and default is valid
-    if [ -z "$DOMAIN_INPUT" ] && [ -n "$DEFAULT_PROMPT" ]; then
-        DOMAIN="${DETECTED_HOSTNAME}"
-    else
-        DOMAIN="${DOMAIN_INPUT}"
-    fi
-
+# Domain resolution order: RELAY_DOMAIN env (automated) -> non-interactive
+# auto-detect -> interactive prompt. RELAY_DOMAIN lets the mailgateway
+# provisioner drive this install without a TTY.
+if [ -n "${RELAY_DOMAIN:-}" ]; then
+    DOMAIN="${RELAY_DOMAIN}"
     if validate_domain "$DOMAIN"; then
-        log_info "Domain: ${DOMAIN}"
+        log_info "Domain (env RELAY_DOMAIN): ${DOMAIN}"
         echo ""
-        break
     else
-        log_error "Invalid domain: '${DOMAIN}'. Must be a valid FQDN (e.g. mail.example.com)"
-        echo ""
+        log_error "Invalid RELAY_DOMAIN: '${DOMAIN}'. Must be a valid FQDN."
+        exit 1
     fi
-done
+elif [ ! -t 0 ] && [ ! -c /dev/tty ]; then
+    # Non-interactive and no RELAY_DOMAIN: fall back to detected hostname
+    DOMAIN="${DETECTED_HOSTNAME}"
+    if validate_domain "$DOMAIN"; then
+        log_info "Domain (auto-detected, non-interactive): ${DOMAIN}"
+        echo ""
+    else
+        log_error "No RELAY_DOMAIN and detected hostname '${DOMAIN}' is invalid (non-interactive mode)."
+        exit 1
+    fi
+else
+    while true; do
+        echo -e "${YELLOW}Enter the fully qualified domain name (FQDN) for this server${DEFAULT_PROMPT}:${NC}"
+        echo -e "${YELLOW}  Example: mail.example.com${NC}"
+        read -r DOMAIN_INPUT < /dev/tty || DOMAIN_INPUT=""
+
+        # Use default if empty and default is valid
+        if [ -z "$DOMAIN_INPUT" ] && [ -n "$DEFAULT_PROMPT" ]; then
+            DOMAIN="${DETECTED_HOSTNAME}"
+        else
+            DOMAIN="${DOMAIN_INPUT}"
+        fi
+
+        if validate_domain "$DOMAIN"; then
+            log_info "Domain: ${DOMAIN}"
+            echo ""
+            break
+        else
+            log_error "Invalid domain: '${DOMAIN}'. Must be a valid FQDN (e.g. mail.example.com)"
+            echo ""
+        fi
+    done
+fi
 
 # Detect OS
 if [ -f /etc/os-release ]; then
@@ -811,7 +835,7 @@ mongodb:
   database: "relay_logs"
 
 mailgateway:
-  relay_server_id: 1
+  relay_server_id: ${RELAY_SERVER_ID:-1}
 
 postfix:
   log_file: "/var/log/mail.log"
@@ -1012,5 +1036,15 @@ echo "  ${INSTALL_DIR}/setup-mailgateway-access.sh --create <isim> # Yeni muster
 echo "  ${INSTALL_DIR}/setup-mailgateway-access.sh --list          # Kullanicilari listele"
 echo "  ${INSTALL_DIR}/setup-mailgateway-access.sh --delete <isim> # Kullanici sil"
 echo ""
+
+# ---------------------------------------------------------------------------
+# Machine-readable result block (automated provisioning by mailgateway).
+# Single stable line parsed by relay_provisioner.py. Keep the ###RELAY_RESULT###
+# marker and JSON shape stable across releases.
+# ---------------------------------------------------------------------------
+RELAY_TLS_STATUS=$([ "$TLS_OBTAINED" = "yes" ] && echo "letsencrypt" || echo "selfsigned")
+printf '###RELAY_RESULT### {"server_ip":"%s","api_url":"http://%s:%s","api_port":%s,"api_secret":"%s","mongo_host":"%s","mongo_port":27017,"mongo_database":"relay_logs","mongo_username":"relay_agent","mongo_password":"%s","mongo_replica_set":"rs0","mongo_auth_source":"relay_logs","tls":"%s","relay_server_id":%s}\n' \
+    "${SERVER_IP}" "${SERVER_IP}" "${API_PORT}" "${API_PORT}" "${API_SECRET}" \
+    "${SERVER_IP}" "${MONGO_RELAY_PASS}" "${RELAY_TLS_STATUS}" "${RELAY_SERVER_ID:-1}"
 }
 _main "$@"

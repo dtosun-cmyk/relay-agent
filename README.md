@@ -36,6 +36,33 @@ cd relay-agent
 sudo ./install.sh
 ```
 
+## Automated / Non-Interactive Install
+
+The installer runs fully unattended when driven by environment variables — this
+is how the Mail Gateway "one-click provisioning" feature installs the agent over
+SSH. No TTY is required.
+
+| Env var | Purpose | Default |
+|---------|---------|---------|
+| `RELAY_DOMAIN` | FQDN for this relay (TLS + Postfix). If unset in non-interactive mode, the detected hostname is used. | detected hostname |
+| `RELAY_SERVER_ID` | Mail Gateway `relay_servers.id` this agent is linked to (written to `mailgateway.relay_server_id`). | `1` |
+| `RELAY_LETSENCRYPT_EMAIL` | Email for a real Let's Encrypt certificate. If unset, a self-signed cert is used. | *(self-signed)* |
+
+```bash
+RELAY_SERVER_ID=7 RELAY_DOMAIN=relay1.example.com \
+RELAY_LETSENCRYPT_EMAIL=admin@example.com \
+  bash install.sh
+```
+
+On success the installer prints a single machine-readable line that automation
+can parse (the human-readable summary is still printed above it):
+
+```
+###RELAY_RESULT### {"server_ip":"...","api_url":"http://...:8080","api_port":8080,"api_secret":"...","mongo_host":"...","mongo_port":27017,"mongo_database":"relay_logs","mongo_username":"relay_agent","mongo_password":"...","mongo_replica_set":"rs0","mongo_auth_source":"relay_logs","tls":"letsencrypt|selfsigned","relay_server_id":7}
+```
+
+The `###RELAY_RESULT###` marker and JSON shape are kept stable across releases.
+
 ## Build from Source
 
 ```bash
