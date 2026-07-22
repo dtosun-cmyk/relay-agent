@@ -151,9 +151,22 @@ if validate_domain "$DETECTED_HOSTNAME"; then
     DEFAULT_PROMPT=" [${DETECTED_HOSTNAME}]"
 fi
 
-# Domain resolution order: RELAY_DOMAIN env (automated) -> non-interactive
-# auto-detect -> interactive prompt. RELAY_DOMAIN lets the mailgateway
-# provisioner drive this install without a TTY.
+# Determine whether we have a usable interactive terminal for prompting.
+# IMPORTANT: [ -c /dev/tty ] is UNRELIABLE — the device node can exist while not
+# being openable (e.g. SSH exec_command without a PTY, as used by the mailgateway
+# provisioner). Testing that /dev/tty can actually be opened avoids an infinite
+# prompt loop where read returns empty forever.
+INTERACTIVE=no
+if [ -t 0 ]; then
+    INTERACTIVE=yes
+elif (exec 3</dev/tty) 2>/dev/null; then
+    exec 3<&- 2>/dev/null || true
+    INTERACTIVE=yes
+fi
+
+# Domain resolution order: RELAY_DOMAIN env (automated) -> interactive prompt
+# -> non-interactive auto-detect -> clean failure. RELAY_DOMAIN lets the
+# mailgateway provisioner drive this install without a TTY.
 if [ -n "${RELAY_DOMAIN:-}" ]; then
     DOMAIN="${RELAY_DOMAIN}"
     if validate_domain "$DOMAIN"; then
@@ -163,17 +176,7 @@ if [ -n "${RELAY_DOMAIN:-}" ]; then
         log_error "Invalid RELAY_DOMAIN: '${DOMAIN}'. Must be a valid FQDN."
         exit 1
     fi
-elif [ ! -t 0 ] && [ ! -c /dev/tty ]; then
-    # Non-interactive and no RELAY_DOMAIN: fall back to detected hostname
-    DOMAIN="${DETECTED_HOSTNAME}"
-    if validate_domain "$DOMAIN"; then
-        log_info "Domain (auto-detected, non-interactive): ${DOMAIN}"
-        echo ""
-    else
-        log_error "No RELAY_DOMAIN and detected hostname '${DOMAIN}' is invalid (non-interactive mode)."
-        exit 1
-    fi
-else
+elif [ "$INTERACTIVE" = "yes" ]; then
     while true; do
         echo -e "${YELLOW}Enter the fully qualified domain name (FQDN) for this server${DEFAULT_PROMPT}:${NC}"
         echo -e "${YELLOW}  Example: mail.example.com${NC}"
@@ -195,6 +198,18 @@ else
             echo ""
         fi
     done
+else
+    # Non-interactive (e.g. SSH provisioning without a PTY) and no RELAY_DOMAIN:
+    # fall back to the detected hostname. Fail cleanly (do NOT loop) if invalid.
+    DOMAIN="${DETECTED_HOSTNAME}"
+    if validate_domain "$DOMAIN"; then
+        log_info "Domain (auto-detected, non-interactive): ${DOMAIN}"
+        echo ""
+    else
+        log_error "No RELAY_DOMAIN provided and server hostname '${DOMAIN}' is not a valid FQDN (non-interactive mode)."
+        log_error "Re-run with RELAY_DOMAIN=your.relay.fqdn set, or set a valid system hostname first. Aborting."
+        exit 1
+    fi
 fi
 
 # Detect OS
