@@ -216,6 +216,37 @@ log_info "Sunucu IP (primary): $SERVER_IP"
 log_info "MongoDB bindIp listesi: $MONGO_BIND_IPS"
 
 #######################################
+# 0. Timezone + Time Sync
+#######################################
+# The relay-agent Postfix log parser assumes Postfix log timestamps are in the
+# mailgateway (main server) timezone. If the relay server runs in a different
+# timezone (e.g. UTC), delivered_at ends up shifted. Align the relay server's
+# timezone with the main server and enable NTP so delivery times match.
+# RELAY_TIMEZONE is passed by the mailgateway provisioner (main server's tz);
+# defaults to Europe/Istanbul when not provided.
+RELAY_TIMEZONE="${RELAY_TIMEZONE:-Europe/Istanbul}"
+log_info "Zaman dilimi ayarlaniyor: ${RELAY_TIMEZONE}"
+if command -v timedatectl >/dev/null 2>&1; then
+    if timedatectl set-timezone "${RELAY_TIMEZONE}" 2>/dev/null; then
+        log_info "Zaman dilimi ayarlandi: ${RELAY_TIMEZONE}"
+    else
+        log_warn "timedatectl ile zaman dilimi ayarlanamadi (gecersiz olabilir): ${RELAY_TIMEZONE}"
+    fi
+    # Enable NTP time synchronization (clock must match main server)
+    timedatectl set-ntp true 2>/dev/null || log_warn "NTP senkronizasyonu etkinlestirilemedi"
+else
+    # Fallback for minimal images without timedatectl
+    if [ -f "/usr/share/zoneinfo/${RELAY_TIMEZONE}" ]; then
+        ln -sf "/usr/share/zoneinfo/${RELAY_TIMEZONE}" /etc/localtime
+        echo "${RELAY_TIMEZONE}" > /etc/timezone
+        log_info "Zaman dilimi (localtime symlink) ayarlandi: ${RELAY_TIMEZONE}"
+    else
+        log_warn "Zaman dilimi verisi bulunamadi: ${RELAY_TIMEZONE}"
+    fi
+fi
+log_info "Guncel zaman: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+
+#######################################
 # 1. System Dependencies
 #######################################
 log_info "Sistem bagimliliklari kuruluyor..."
