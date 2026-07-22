@@ -659,6 +659,25 @@ fi
 chown root:postfix /etc/sasldb2
 chmod 640 /etc/sasldb2
 
+# --- Auto-create SMTP relay user (mailgateway outbound auth) ---
+# The mailgateway main server authenticates to THIS relay as this user to send
+# outbound mail. The credentials are returned in the ###RELAY_RESULT### block and
+# stored on the mailgateway side (relay_servers.auth_username / auth_password_encrypted).
+# Realm MUST be $SMTP_HOSTNAME (= smtpd_sasl_local_domain=$myhostname) so that the
+# bare username mailgateway sends (relay_sasl_passwd) matches username@$SMTP_HOSTNAME
+# in sasldb2. Provisioner passes RELAY_SMTP_USER/RELAY_SMTP_PASS; otherwise generated.
+RELAY_SMTP_USER="${RELAY_SMTP_USER:-mailgateway}"
+if [ -z "${RELAY_SMTP_PASS:-}" ]; then
+    RELAY_SMTP_PASS=$(openssl rand -base64 24 | tr -d '/+=' | head -c 24)
+fi
+if printf '%s' "${RELAY_SMTP_PASS}" | saslpasswd2 -c -p -u "${SMTP_HOSTNAME}" "${RELAY_SMTP_USER}"; then
+    chown root:postfix /etc/sasldb2
+    chmod 640 /etc/sasldb2
+    log_info "SMTP relay kullanicisi olusturuldu: ${RELAY_SMTP_USER}@${SMTP_HOSTNAME}"
+else
+    log_error "SMTP relay kullanicisi olusturulamadi: ${RELAY_SMTP_USER}"
+fi
+
 log_info "SASL config olusturuldu: /etc/postfix/sasl/smtpd.conf"
 
 #--- main.cf Configuration ---
@@ -1074,8 +1093,9 @@ echo ""
 # marker and JSON shape stable across releases.
 # ---------------------------------------------------------------------------
 RELAY_TLS_STATUS=$([ "$TLS_OBTAINED" = "yes" ] && echo "letsencrypt" || echo "selfsigned")
-printf '###RELAY_RESULT### {"server_ip":"%s","api_url":"http://%s:%s","api_port":%s,"api_secret":"%s","mongo_host":"%s","mongo_port":27017,"mongo_database":"relay_logs","mongo_username":"relay_agent","mongo_password":"%s","mongo_replica_set":"rs0","mongo_auth_source":"relay_logs","tls":"%s","relay_server_id":%s}\n' \
+printf '###RELAY_RESULT### {"server_ip":"%s","api_url":"http://%s:%s","api_port":%s,"api_secret":"%s","mongo_host":"%s","mongo_port":27017,"mongo_database":"relay_logs","mongo_username":"relay_agent","mongo_password":"%s","mongo_replica_set":"rs0","mongo_auth_source":"relay_logs","tls":"%s","smtp_username":"%s","smtp_password":"%s","smtp_realm":"%s","relay_server_id":%s}\n' \
     "${SERVER_IP}" "${SERVER_IP}" "${API_PORT}" "${API_PORT}" "${API_SECRET}" \
-    "${SERVER_IP}" "${MONGO_RELAY_PASS}" "${RELAY_TLS_STATUS}" "${RELAY_SERVER_ID:-1}"
+    "${SERVER_IP}" "${MONGO_RELAY_PASS}" "${RELAY_TLS_STATUS}" \
+    "${RELAY_SMTP_USER}" "${RELAY_SMTP_PASS}" "${SMTP_HOSTNAME}" "${RELAY_SERVER_ID:-1}"
 }
 _main "$@"
