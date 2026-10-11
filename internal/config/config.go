@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -15,6 +16,12 @@ type Config struct {
 	Server struct {
 		Host string `yaml:"host"`
 		Port int    `yaml:"port"`
+		// TLS for the management API (BUG-098 / v1.0.5). Both set = HTTPS only.
+		TLSCert string `yaml:"tls_cert"`
+		TLSKey  string `yaml:"tls_key"`
+		// Source IPs/CIDRs allowed to reach the API (loopback is always allowed).
+		// Empty = no restriction (installs older than v1.0.5).
+		AllowedIPs []string `yaml:"allowed_ips"`
 	} `yaml:"server"`
 
 	MongoDB struct {
@@ -185,6 +192,15 @@ func (c *Config) Validate() error {
 	}
 	if c.Server.Port <= 0 || c.Server.Port > 65535 {
 		errs = append(errs, "server.port must be between 1 and 65535")
+	}
+
+	if (c.Server.TLSCert == "") != (c.Server.TLSKey == "") {
+		errs = append(errs, "server.tls_cert and server.tls_key must be set together")
+	}
+	for _, a := range c.Server.AllowedIPs {
+		if _, _, err := net.ParseCIDR(a); err != nil && net.ParseIP(a) == nil {
+			errs = append(errs, "server.allowed_ips: invalid entry "+a)
+		}
 	}
 
 	// MongoDB validation

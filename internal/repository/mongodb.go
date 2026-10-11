@@ -371,6 +371,47 @@ func (r *MongoRepository) UpdateWebhookStatus(ctx context.Context, queueID strin
 	return nil
 }
 
+// UpdateByQueueID updates the record that already carries this relay queue ID (written when
+// the message was first seen or flushed as deferred) with a later delivery result. The parser
+// keeps mailgateway_queue_id/sender only in memory, so after an agent restart or after a
+// long-deferred entry was dropped as stale, the final sent/bounced line arrives without them;
+// queue_id is unique in the collection and still identifies the message. Returns the
+// mailgateway_queue_id of the updated record, "" when no record has this queue ID.
+func (r *MongoRepository) UpdateByQueueID(ctx context.Context, email *Email) (string, error) {
+	if email.QueueID == "" {
+		return "", nil
+	}
+	filter := bson.M{
+		"queue_id":             email.QueueID,
+		"mailgateway_queue_id": bson.M{"$ne": ""},
+	}
+	set := bson.M{
+		"status":           email.Status,
+		"dsn":              email.DSN,
+		"status_message":   email.StatusMessage,
+		"delivery_time_ms": email.DeliveryTimeMs,
+		"delivered_at":     email.DeliveredAt,
+		"updated_at":       util.NowTurkey(),
+	}
+	if email.RelayHost != "" {
+		set["relay_host"] = email.RelayHost
+		set["relay_ip"] = email.RelayIP
+	}
+	if email.Provider != "" {
+		set["provider"] = email.Provider
+	}
+	update := bson.M{"$set": set, "$inc": bson.M{"attempts": 1}}
+	opts := options.FindOneAndUpdate().SetReturnDocument(options.After)
+	var updated Email
+	if err := r.emails.FindOneAndUpdate(ctx, filter, update, opts).Decode(&updated); err != nil {
+		if err == mongo.ErrNoDocuments {
+			return "", nil
+		}
+		return "", fmt.Errorf("failed to update by queue id: %w", err)
+	}
+	return updated.MailgatewayQueueID, nil
+}
+
 // UpdateByRecipientMatch finds a recent "received" record matching recipient+sender
 // and updates it with delivery info. Used when mailgateway_queue_id is not available
 // (e.g., reinjected emails from content_filter).

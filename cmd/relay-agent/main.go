@@ -136,6 +136,9 @@ func main() {
 			Version:       Version,
 			SMTPDomain:    cfg.SMTP.Domain,
 			SMTPAPISecret: cfg.SMTP.APISecret,
+			TLSCert:       cfg.Server.TLSCert,
+			TLSKey:        cfg.Server.TLSKey,
+			AllowedIPs:    cfg.Server.AllowedIPs,
 		},
 		repo,
 		statsCollector,
@@ -351,7 +354,12 @@ func (bp *BatchProcessor) Start(ctx context.Context) {
 		for _, email := range matchEmails {
 			// No MailgatewayQueueID - try to match with existing filter record
 			// This handles reinjected emails from content_filter
-			mailgatewayQueueID, err := bp.repo.UpdateByRecipientMatch(insertCtx, email)
+			// first the record that already has this relay queue ID (survives agent restarts and
+			// stale-entry cleanup of long-deferred mail), then the recent recipient+sender match
+			mailgatewayQueueID, err := bp.repo.UpdateByQueueID(insertCtx, email)
+			if err == nil && mailgatewayQueueID == "" {
+				mailgatewayQueueID, err = bp.repo.UpdateByRecipientMatch(insertCtx, email)
+			}
 			if err != nil {
 				bp.logger.Error().
 					Err(err).

@@ -111,6 +111,28 @@ BINARY_NAME="relay-agent-linux-amd64"
 # Version: override with ./install.sh v1.0.1 or uses latest
 RELEASE_TAG="${1:-latest}"
 
+# Mail Gateway provisioning (v1.0.5, BUG-098):
+#   RELAY_AGENT_BINARY   path of a binary already copied to this server (no download)
+#   RELAY_AGENT_SHA256   expected sha256 of the binary (local or downloaded); mismatch aborts
+#   RELAY_AGENT_VERSION  version label reported back to Mail Gateway
+#   RELAY_ALLOWED_IPS    comma list of IPs/CIDRs (Mail Gateway servers) allowed to use the
+#                        management API and the MongoDB relay_agent account; loopback always
+RELAY_AGENT_BINARY="${RELAY_AGENT_BINARY:-}"
+RELAY_AGENT_SHA256="${RELAY_AGENT_SHA256:-}"
+RELAY_AGENT_VERSION="${RELAY_AGENT_VERSION:-${RELEASE_TAG}}"
+RELAY_ALLOWED_IPS="$(echo "${RELAY_ALLOWED_IPS:-}" | tr -d '[:space:]')"
+if [ -n "$RELAY_ALLOWED_IPS" ] && ! [[ "$RELAY_ALLOWED_IPS" =~ ^[0-9a-fA-F:.,/]+$ ]]; then
+    echo "RELAY_ALLOWED_IPS gecersiz karakter iceriyor" >&2
+    exit 1
+fi
+# MongoDB users may only log in from these sources (loopback + Mail Gateway servers)
+MONGO_CLIENT_SOURCES='"127.0.0.1", "::1"'
+if [ -n "$RELAY_ALLOWED_IPS" ]; then
+    for _src in $(echo "$RELAY_ALLOWED_IPS" | tr ',' ' '); do
+        MONGO_CLIENT_SOURCES="${MONGO_CLIENT_SOURCES}, \"${_src}\""
+    done
+fi
+
 # Check root
 if [ "$EUID" -ne 0 ]; then
     log_error "Root olarak calistirin: sudo ./install.sh"
@@ -227,8 +249,24 @@ log_info "Isletim Sistemi: $OS $VERSION_ID"
 # Detect Server IP / bind list for MongoDB
 SERVER_IP=$(detect_primary_ip)
 MONGO_BIND_IPS=$(build_mongo_bind_ips)
+# The driver reaches the single-node replica set through its member address (SERVER_IP), so
+# this server's own addresses must be allowed sources too.
+MONGO_LOCAL_SOURCES='"127.0.0.1", "::1"'
+for _src in $(echo "$MONGO_BIND_IPS" | tr ',' ' '); do
+    [ "$_src" = "127.0.0.1" ] && continue
+    MONGO_LOCAL_SOURCES="${MONGO_LOCAL_SOURCES}, \"${_src}\""
+    MONGO_CLIENT_SOURCES="${MONGO_CLIENT_SOURCES}, \"${_src}\""
+done
 log_info "Sunucu IP (primary): $SERVER_IP"
 log_info "MongoDB bindIp listesi: $MONGO_BIND_IPS"
+# relay_agent account: same rule as the management API - restricted to RELAY_ALLOWED_IPS when
+# given, otherwise no IP filter (password only; manual installs without the variable)
+if [ -n "$RELAY_ALLOWED_IPS" ]; then
+    MONGO_RELAY_RESTRICTION="[{ clientSource: [${MONGO_CLIENT_SOURCES}] }]"
+else
+    MONGO_RELAY_RESTRICTION="[]"
+    log_warn "RELAY_ALLOWED_IPS bos: ajan API'si ve MongoDB relay_agent hesabi IP ile sinirlanmiyor (yalniz parola). Guvenlik duvarinda 8080/27017'yi yalniz Mail Gateway sunucusuna acin."
+fi
 
 #######################################
 # 0. Timezone + Time Sync
@@ -417,13 +455,15 @@ mongosh --quiet << EOF
 use admin
 try {
     if (db.getUser("admin")) {
-        db.updateUser("admin", { pwd: "${MONGO_ADMIN_PASS}", roles: ["root"] });
+        db.updateUser("admin", { pwd: "${MONGO_ADMIN_PASS}", roles: ["root"],
+            authenticationRestrictions: [{ clientSource: [${MONGO_LOCAL_SOURCES}] }] });
         print("admin user updated");
     } else {
         db.createUser({
             user: "admin",
             pwd: "${MONGO_ADMIN_PASS}",
-            roles: ["root"]
+            roles: ["root"],
+            authenticationRestrictions: [{ clientSource: [${MONGO_LOCAL_SOURCES}] }]
         });
         print("admin user created");
     }
@@ -442,14 +482,16 @@ try {
     if (db.getUser("relay_agent")) {
         db.updateUser("relay_agent", {
             pwd: "${MONGO_RELAY_PASS}",
-            roles: [{ role: "readWrite", db: "relay_logs" }]
+            roles: [{ role: "readWrite", db: "relay_logs" }],
+            authenticationRestrictions: ${MONGO_RELAY_RESTRICTION}
         });
         print("relay_agent user updated");
     } else {
         db.createUser({
             user: "relay_agent",
             pwd: "${MONGO_RELAY_PASS}",
-            roles: [{ role: "readWrite", db: "relay_logs" }]
+            roles: [{ role: "readWrite", db: "relay_logs" }],
+            authenticationRestrictions: ${MONGO_RELAY_RESTRICTION}
         });
         print("relay_agent user created");
     }
@@ -458,6 +500,32 @@ try {
     quit(1);
 }
 EOF
+
+# Dedicated TLS certificate for the management API and MongoDB (v1.0.5, BUG-098).
+# Self-signed, 10 years, generated once and kept across re-installs: Mail Gateway pins it
+# (it is not the Postfix/Let's Encrypt certificate, so renewals never break the pin).
+AGENT_TLS_DIR="${INSTALL_DIR}/tls"
+mkdir -p "$AGENT_TLS_DIR"
+chmod 755 "$AGENT_TLS_DIR"
+if [ ! -s "$AGENT_TLS_DIR/agent.crt" ] || [ ! -s "$AGENT_TLS_DIR/agent.key" ]; then
+    log_info "Agent TLS sertifikasi olusturuluyor (API + MongoDB)..."
+    openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 3650 \
+        -keyout "$AGENT_TLS_DIR/agent.key" -out "$AGENT_TLS_DIR/agent.crt" \
+        -subj "/CN=${DOMAIN}/O=relay-agent" \
+        -addext "subjectAltName=IP:${SERVER_IP},DNS:${DOMAIN},DNS:localhost,IP:127.0.0.1" \
+        -addext "basicConstraints=critical,CA:TRUE" \
+        -addext "keyUsage=critical,digitalSignature,keyEncipherment,keyCertSign" \
+        -addext "extendedKeyUsage=serverAuth" >/dev/null 2>&1 || { log_error "Agent TLS sertifikasi olusturulamadi"; exit 1; }
+fi
+chmod 600 "$AGENT_TLS_DIR/agent.key"
+chmod 644 "$AGENT_TLS_DIR/agent.crt"
+mkdir -p /etc/mongodb
+cat "$AGENT_TLS_DIR/agent.key" "$AGENT_TLS_DIR/agent.crt" > /etc/mongodb/relay-agent-tls.pem
+chown mongodb:mongodb /etc/mongodb/relay-agent-tls.pem 2>/dev/null || true
+chmod 600 /etc/mongodb/relay-agent-tls.pem
+# MongoDB 7+/8 refuses TLS without a chain of trust (CAFile). The agent certificate is its
+# own CA (self-signed, CA:TRUE), so its public part is the trust anchor.
+install -m 644 "$AGENT_TLS_DIR/agent.crt" /etc/mongodb/relay-agent-ca.pem
 
 # Rewrite mongod.conf WITH auth enabled
 log_info "MongoDB auth etkinlestiriliyor..."
@@ -473,6 +541,11 @@ systemLog:
 net:
   port: 27017
   bindIp: ${MONGO_BIND_IPS}
+  tls:
+    mode: preferTLS
+    certificateKeyFile: /etc/mongodb/relay-agent-tls.pem
+    CAFile: /etc/mongodb/relay-agent-ca.pem
+    allowConnectionsWithoutCertificates: true
 
 processManagement:
   timeZoneInfo: /usr/share/zoneinfo
@@ -543,8 +616,9 @@ LE_EMAIL=""
 if [ -n "${RELAY_LETSENCRYPT_EMAIL:-}" ]; then
     LE_EMAIL="${RELAY_LETSENCRYPT_EMAIL}"
     log_info "Let's Encrypt email: ${LE_EMAIL}"
-elif [ -t 0 ] || [ -c /dev/tty ]; then
-    # Interactive mode - ask user (works with both ./install.sh and curl|bash)
+elif [ "$INTERACTIVE" = "yes" ]; then
+    # Interactive mode - ask user (works with both ./install.sh and curl|bash);
+    # never in a provisioned (non-interactive) run: /dev/tty exists but cannot be opened there
     echo ""
     echo -e "${YELLOW}Let's Encrypt email adresi (opsiyonel, bos birakabilirsiniz):${NC}"
     read -r LE_EMAIL_INPUT < /dev/tty || LE_EMAIL_INPUT=""
@@ -587,6 +661,17 @@ else
     TLS_CERT_FILE="/etc/ssl/certs/ssl-cert-snakeoil.pem"
     TLS_KEY_FILE="/etc/ssl/private/ssl-cert-snakeoil.key"
     TLS_OBTAINED="no"
+fi
+
+if [ "$TLS_OBTAINED" = "yes" ]; then
+    mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+    cat > /etc/letsencrypt/renewal-hooks/deploy/relay-agent-postfix-reload.sh << 'HOOK'
+#!/bin/bash
+# relay-agent: Postfix reads its certificate only at start/reload
+systemctl reload postfix
+logger -t relay-agent "certificate renewed, postfix reloaded"
+HOOK
+    chmod 755 /etc/letsencrypt/renewal-hooks/deploy/relay-agent-postfix-reload.sh
 fi
 
 #######################################
@@ -717,6 +802,9 @@ postconf -e "smtputf8_enable = no"
 
 # Set hostname and destination
 postconf -e "myhostname = ${SMTP_HOSTNAME}"
+# The main server connects to 587 from outside: never inherit "loopback-only" from an
+# earlier configuration (port 25 stays closed - master.cf has no smtp inet service)
+postconf -e "inet_interfaces = all"
 postconf -e "mydestination = ${DOMAIN}, localhost.localdomain, localhost"
 
 # TLS certificate and key
@@ -786,7 +874,15 @@ fi
 # Add reinjection service for relay-agent
 # Port ${SMTP_FILTER_PORT} is owned by relay-agent (SMTP filter), NOT Postfix
 # Port ${REINJECTION_PORT} is owned by Postfix (reinjection after filter)
-if ! grep -q "reinjection.*${REINJECTION_PORT}" /etc/postfix/master.cf 2>/dev/null; then
+# (older install.sh versions appended one copy per run: the old check never matched)
+REINJ_COUNT=$(grep -cE "^127\.0\.0\.1:${REINJECTION_PORT}[[:space:]]+inet" /etc/postfix/master.cf 2>/dev/null || true)
+if [ "${REINJ_COUNT:-0}" -gt 1 ]; then
+    postconf -MX "127.0.0.1:${REINJECTION_PORT}/inet"
+    sed -i '/^# Reinjection service - accepts filtered mail from relay-agent/d; /^# relay-agent listens on [0-9]* (not managed by Postfix)$/d' /etc/postfix/master.cf
+    log_warn "Yinelenen reinjection servisleri temizlendi (${REINJ_COUNT} kopya)"
+    REINJ_COUNT=0
+fi
+if [ "${REINJ_COUNT:-0}" -eq 0 ]; then
     cat >> /etc/postfix/master.cf << EOF
 
 # Reinjection service - accepts filtered mail from relay-agent and delivers
@@ -818,6 +914,50 @@ if grep -q "^127.0.0.1:${SMTP_FILTER_PORT}.*inet" /etc/postfix/master.cf 2>/dev/
     log_info "Port ${SMTP_FILTER_PORT} Postfix'ten kaldirildi"
 fi
 
+# Postfix without a systemd unit (built from source or a vendor package such as
+# Mail Gateway's own mxgate-postfix): give the default instance a unit and the
+# ownership the Debian package would have set, otherwise "systemctl enable" aborts
+# the install (set -e) and the queue directories stay root-owned.
+if ! systemctl cat postfix.service >/dev/null 2>&1; then
+    log_warn "postfix.service bulunamadi (paketsiz Postfix) - varsayilan ornek icin birim olusturuluyor"
+    cat > /etc/systemd/system/postfix.service << 'UNITEOF'
+[Unit]
+Description=Postfix Mail Transport Agent (relay-agent default instance)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+PIDFile=/var/spool/postfix/pid/master.pid
+ExecStart=/usr/sbin/postfix start
+ExecReload=/usr/sbin/postfix reload
+ExecStop=/usr/sbin/postfix stop
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNITEOF
+    systemctl daemon-reload
+fi
+if grep -q "relay-agent default instance" /etc/systemd/system/postfix.service 2>/dev/null; then
+    # Debian's unit copies resolv.conf & co. into the chroot before every start; ours does
+    # not, so run the services unchrooted (a chrooted smtp(8) would find no DNS at all)
+    postconf -F '*/*/chroot = n'
+    # non-zero exit when optional files (man pages) are missing; the queue ownership is what matters
+    postfix set-permissions >/dev/null 2>&1 || true
+    if [ "$(stat -c %U /var/spool/postfix/active 2>/dev/null)" != "postfix" ]; then
+        log_error "Postfix kuyruk dizinlerinin sahipligi duzeltilemedi (postfix set-permissions)"
+        exit 1
+    fi
+fi
+
+# Port 587 must be free for the relay's submission service
+if ss -ltnH "( sport = :587 )" 2>/dev/null | grep -q . && ! ss -ltnpH "( sport = :587 )" 2>/dev/null | grep -q '"master"'; then
+    log_error "Port 587 baska bir servis tarafindan kullaniliyor: $(ss -ltnpH '( sport = :587 )' | head -1)"
+    exit 1
+fi
+
 # Enable and start Postfix
 systemctl enable postfix
 systemctl restart postfix
@@ -845,10 +985,10 @@ else
     DOWNLOAD_URL="https://github.com/${GITHUB_REPO}/releases/download/${RELEASE_TAG}/${BINARY_NAME}"
 fi
 
-log_info "Indiriliyor: $DOWNLOAD_URL"
-
-# Download binary
-if ! curl -fSL -o "$INSTALL_DIR/bin/relay-agent" "$DOWNLOAD_URL"; then
+if [ -n "$RELAY_AGENT_BINARY" ] && [ -f "$RELAY_AGENT_BINARY" ]; then
+    log_info "Yerel binary kullaniliyor: $RELAY_AGENT_BINARY"
+    install -m 0755 "$RELAY_AGENT_BINARY" "$INSTALL_DIR/bin/relay-agent.new"
+elif ! log_info "Indiriliyor: $DOWNLOAD_URL" || ! curl -fSL -o "$INSTALL_DIR/bin/relay-agent.new" "$DOWNLOAD_URL"; then
     log_error "Binary indirilemedi! URL: $DOWNLOAD_URL"
     log_error "Releases sayfasini kontrol edin: https://github.com/${GITHUB_REPO}/releases"
     log_info ""
@@ -859,8 +999,18 @@ if ! curl -fSL -o "$INSTALL_DIR/bin/relay-agent" "$DOWNLOAD_URL"; then
     exit 1
 fi
 
-chmod +x "$INSTALL_DIR/bin/relay-agent"
-log_info "Relay Agent binary indirildi: $INSTALL_DIR/bin/relay-agent"
+if [ -n "$RELAY_AGENT_SHA256" ]; then
+    GOT_SHA=$(sha256sum "$INSTALL_DIR/bin/relay-agent.new" | awk '{print $1}')
+    if [ "$GOT_SHA" != "$RELAY_AGENT_SHA256" ]; then
+        rm -f "$INSTALL_DIR/bin/relay-agent.new"
+        log_error "Binary sha256 uyusmuyor (beklenen ${RELAY_AGENT_SHA256}, gelen ${GOT_SHA}) - kurulum durduruldu"
+        exit 1
+    fi
+    log_info "Binary sha256 dogrulandi"
+fi
+chmod +x "$INSTALL_DIR/bin/relay-agent.new"
+mv -f "$INSTALL_DIR/bin/relay-agent.new" "$INSTALL_DIR/bin/relay-agent"
+log_info "Relay Agent binary kuruldu: $INSTALL_DIR/bin/relay-agent"
 
 # Download setup-mailgateway-access.sh
 log_info "Mailgateway setup scripti indiriliyor..."
@@ -870,7 +1020,9 @@ else
     SCRIPT_BRANCH="$RELEASE_TAG"
 fi
 
-if curl -fsSL -o "$INSTALL_DIR/setup-mailgateway-access.sh" \
+if [ -n "$RELAY_AGENT_BINARY" ]; then
+    log_info "Mailgateway setup scripti atlandi (yerel kurulum)"
+elif curl -fsSL -o "$INSTALL_DIR/setup-mailgateway-access.sh" \
     "https://raw.githubusercontent.com/${GITHUB_REPO}/${SCRIPT_BRANCH}/setup-mailgateway-access.sh"; then
     chmod +x "$INSTALL_DIR/setup-mailgateway-access.sh"
     log_info "Mailgateway setup scripti indirildi: $INSTALL_DIR/setup-mailgateway-access.sh"
@@ -881,11 +1033,22 @@ fi
 #######################################
 # 7. Create Default Config
 #######################################
-if [ ! -f "$INSTALL_DIR/config/config.yaml" ]; then
-    log_info "Varsayilan yapilandirma olusturuluyor..."
+API_SECRET=""
+if [ -f "$INSTALL_DIR/config/config.yaml" ]; then
+    API_SECRET=$(grep "api_secret:" "$INSTALL_DIR/config/config.yaml" 2>/dev/null | head -1 | awk '{print $2}' | tr -d '"')
+    cp -p "$INSTALL_DIR/config/config.yaml" "$INSTALL_DIR/config/config.yaml.$(date +%Y%m%d_%H%M%S).bak"
+fi
+ALLOWED_YAML=""
+for _src in $(echo "$RELAY_ALLOWED_IPS" | tr ',' ' '); do
+    ALLOWED_YAML="${ALLOWED_YAML}
+    - \"${_src}\""
+done
+[ -z "$ALLOWED_YAML" ] && ALLOWED_YAML=" []"
+if true; then
+    log_info "Yapilandirma yaziliyor (API secret korunur)..."
 
-    # Generate random API secret
-    API_SECRET=$(openssl rand -base64 24 | tr -d '/+=' | head -c 32)
+    # Generate random API secret (first install only)
+    [ -z "$API_SECRET" ] && API_SECRET=$(openssl rand -base64 24 | tr -d '/+=' | head -c 32)
 
     cat > "$INSTALL_DIR/config/config.yaml" << EOF
 # Relay Agent Configuration
@@ -894,6 +1057,9 @@ if [ ! -f "$INSTALL_DIR/config/config.yaml" ]; then
 server:
   host: "0.0.0.0"
   port: ${API_PORT}
+  tls_cert: "${AGENT_TLS_DIR}/agent.crt"
+  tls_key: "${AGENT_TLS_DIR}/agent.key"
+  allowed_ips:${ALLOWED_YAML}
 
 mongodb:
   uri: "mongodb://relay_agent:${MONGO_RELAY_PASS}@localhost:27017/relay_logs?authSource=relay_logs&replicaSet=rs0"
@@ -925,6 +1091,7 @@ logging:
   file: "${INSTALL_DIR}/logs/agent.log"
 EOF
 
+    chmod 600 "$INSTALL_DIR/config/config.yaml"
     log_info "Config olusturuldu: $INSTALL_DIR/config/config.yaml"
 fi
 
@@ -978,7 +1145,7 @@ log_info "Systemd servisi olusturuldu"
 #######################################
 log_info "Relay Agent baslatiliyor..."
 
-systemctl start relay-agent
+systemctl restart relay-agent
 sleep 2
 
 if systemctl is-active --quiet relay-agent; then
@@ -1064,13 +1231,22 @@ echo "API Port:     ${API_PORT}"
 echo "SMTP Filter:  ${SMTP_FILTER_PORT}"
 echo ""
 echo "API:"
-echo "  Address:    http://${SERVER_IP}:${API_PORT}"
-echo "  Secret:     ${API_SECRET}"
-echo "  Test:       curl -H 'X-API-Secret: ${API_SECRET}' http://localhost:${API_PORT}/api/queue"
+echo "  Address:    https://${SERVER_IP}:${API_PORT}"
+if [ "$INTERACTIVE" = "yes" ]; then
+    echo "  Secret:     ${API_SECRET}"
+    echo "  Test:       curl -k -H 'X-API-Secret: ${API_SECRET}' https://localhost:${API_PORT}/api/queue"
+else
+    echo "  Secret:     (gizli - ${CRED_FILE})"
+fi
 echo ""
 echo "MongoDB:"
-echo "  Admin Pass:       ${MONGO_ADMIN_PASS}"
-echo "  Relay Agent Pass: ${MONGO_RELAY_PASS}"
+if [ "$INTERACTIVE" = "yes" ]; then
+    echo "  Admin Pass:       ${MONGO_ADMIN_PASS}"
+    echo "  Relay Agent Pass: ${MONGO_RELAY_PASS}"
+else
+    echo "  Parolalar:        (gizli - ${CRED_FILE})"
+fi
+echo "  TLS:              preferTLS (${AGENT_TLS_DIR}/agent.crt)"
 echo "  Auth:             enabled"
 echo ""
 if [ "$TLS_OBTAINED" = "yes" ]; then
@@ -1096,11 +1272,13 @@ echo "  systemctl status relay-agent"
 echo "  systemctl restart relay-agent"
 echo "  journalctl -u relay-agent -f"
 echo ""
+if [ -x "${INSTALL_DIR}/setup-mailgateway-access.sh" ]; then
 echo "MongoDB Kullanici Yonetimi:"
 echo "  ${INSTALL_DIR}/setup-mailgateway-access.sh --create <isim> # Yeni musteri olustur"
 echo "  ${INSTALL_DIR}/setup-mailgateway-access.sh --list          # Kullanicilari listele"
 echo "  ${INSTALL_DIR}/setup-mailgateway-access.sh --delete <isim> # Kullanici sil"
 echo ""
+fi
 
 # ---------------------------------------------------------------------------
 # Machine-readable result block (automated provisioning by mailgateway).
@@ -1108,9 +1286,11 @@ echo ""
 # marker and JSON shape stable across releases.
 # ---------------------------------------------------------------------------
 RELAY_TLS_STATUS=$([ "$TLS_OBTAINED" = "yes" ] && echo "letsencrypt" || echo "selfsigned")
-printf '###RELAY_RESULT### {"server_ip":"%s","api_url":"http://%s:%s","api_port":%s,"api_secret":"%s","mongo_host":"%s","mongo_port":27017,"mongo_database":"relay_logs","mongo_username":"relay_agent","mongo_password":"%s","mongo_replica_set":"rs0","mongo_auth_source":"relay_logs","tls":"%s","smtp_username":"%s","smtp_password":"%s","smtp_realm":"%s","relay_server_id":%s}\n' \
-    "${SERVER_IP}" "${SERVER_IP}" "${API_PORT}" "${API_PORT}" "${API_SECRET}" \
-    "${SERVER_IP}" "${MONGO_RELAY_PASS}" "${RELAY_TLS_STATUS}" \
-    "${RELAY_SMTP_USER}" "${RELAY_SMTP_PASS}" "${SMTP_HOSTNAME}" "${RELAY_SERVER_ID:-1}"
+AGENT_CERT_B64=$(base64 -w0 "${AGENT_TLS_DIR}/agent.crt")
+SMTP_TLS_FP=$(openssl x509 -in "${TLS_CERT_FILE}" -noout -fingerprint -sha256 2>/dev/null | sed 's/.*=//')
+printf '###RELAY_RESULT### {"server_ip":"%s","api_url":"https://%s:%s","api_port":%s,"api_secret":"%s","api_tls_cert":"%s","mongo_host":"%s","mongo_port":27017,"mongo_database":"relay_logs","mongo_username":"relay_agent","mongo_password":"%s","mongo_replica_set":"rs0","mongo_auth_source":"relay_logs","mongo_tls":true,"tls":"%s","smtp_tls_fingerprint":"%s","smtp_hostname":"%s","smtp_username":"%s","smtp_password":"%s","smtp_realm":"%s","agent_version":"%s","relay_server_id":%s}\n' \
+    "${SERVER_IP}" "${SERVER_IP}" "${API_PORT}" "${API_PORT}" "${API_SECRET}" "${AGENT_CERT_B64}" \
+    "${SERVER_IP}" "${MONGO_RELAY_PASS}" "${RELAY_TLS_STATUS}" "${SMTP_TLS_FP}" "${SMTP_HOSTNAME}" \
+    "${RELAY_SMTP_USER}" "${RELAY_SMTP_PASS}" "${SMTP_HOSTNAME}" "${RELAY_AGENT_VERSION}" "${RELAY_SERVER_ID:-1}"
 }
 _main "$@"

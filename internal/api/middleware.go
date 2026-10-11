@@ -1,6 +1,8 @@
 package api
 
 import (
+	"crypto/subtle"
+	"net"
 	"net/http"
 	"runtime/debug"
 	"time"
@@ -67,22 +69,33 @@ func (s *Server) recoveryMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// corsMiddleware adds CORS headers to allow cross-origin requests.
-func (s *Server) corsMiddleware(next http.Handler) http.Handler {
+// allowListMiddleware rejects requests whose source address is not loopback and not in
+// server.allowed_ips (BUG-098 / v1.0.5). The TCP peer address is used, never forwarded headers.
+func (s *Server) allowListMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Set CORS headers
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Secret")
-		w.Header().Set("Access-Control-Max-Age", "3600")
-
-		// Handle preflight requests
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
+		if len(s.allowed) == 0 {
+			next.ServeHTTP(w, r)
 			return
 		}
-
-		next.ServeHTTP(w, r)
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			host = r.RemoteAddr
+		}
+		ip := net.ParseIP(host)
+		if ip != nil && ip.IsLoopback() {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if ip != nil {
+			for _, n := range s.allowed {
+				if n.Contains(ip) {
+					next.ServeHTTP(w, r)
+					return
+				}
+			}
+		}
+		s.logger.Warn().Str("remote_addr", r.RemoteAddr).Str("path", r.URL.Path).Msg("Source address not allowed")
+		writeError(w, http.StatusForbidden, "Source address not allowed")
 	})
 }
 
@@ -106,7 +119,7 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		if apiSecret != s.smtpAPISecret {
+		if subtle.ConstantTimeCompare([]byte(apiSecret), []byte(s.smtpAPISecret)) != 1 {
 			s.logger.Warn().
 				Str("path", r.URL.Path).
 				Str("remote_addr", r.RemoteAddr).
