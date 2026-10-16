@@ -23,7 +23,10 @@ type Email struct {
 	DeliveryTimeMs int64     `bson:"delivery_time_ms"`
 
 	// String fields (16 bytes each on 64-bit systems - pointer + length)
-	QueueID            string `bson:"queue_id"`
+	// queue_id = the relay's Postfix queue ID of the delivered (re-injected) message. omitempty: an unknown
+	// queue ID is not stored as "" — the unique index only covers non-empty values (v1.0.6: one stored ""
+	// blocked every later record in v1.0.5).
+	QueueID            string `bson:"queue_id,omitempty"`
 	MailgatewayQueueID string `bson:"mailgateway_queue_id"`
 	Sender             string `bson:"sender"`
 	Recipient          string `bson:"recipient"`

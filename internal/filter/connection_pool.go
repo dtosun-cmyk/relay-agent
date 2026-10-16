@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net"
 	"net/smtp"
+	"regexp"
 	"sync"
 	"time"
 )
@@ -206,12 +207,24 @@ func (p *SMTPConnectionPool) Stats() (reused, newConns, errors int64, current in
 	return p.reused, p.newConns, p.errors, len(p.pool)
 }
 
-// SendEmail sends an email using a pooled connection.
-// This is a convenience method that handles get/put automatically.
-func (p *SMTPConnectionPool) SendEmail(from string, recipients []string, data []byte) error {
+// queuedAsRe reads Postfix's queue ID from the end-of-data reply ("250 2.0.0 Ok: queued as 9521F3A17CC").
+var queuedAsRe = regexp.MustCompile(`queued as ([0-9A-Za-z]+)`)
+
+// QueueIDFromReply returns the queue ID of a Postfix end-of-data reply ("" when the reply has none).
+func QueueIDFromReply(msg string) string {
+	if m := queuedAsRe.FindStringSubmatch(msg); m != nil {
+		return m[1]
+	}
+	return ""
+}
+
+// SendEmail sends an email using a pooled connection and returns the next hop's end-of-data reply text.
+// The reply carries the queue ID Postfix gave the re-injected message — the ID its delivery log line uses,
+// so the delivery result is attached to the record exactly (v1.0.6; net/smtp's Data().Close() drops the text).
+func (p *SMTPConnectionPool) SendEmail(from string, recipients []string, data []byte) (string, error) {
 	client, err := p.Get()
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	// Always try to return connection to pool
@@ -239,36 +252,44 @@ func (p *SMTPConnectionPool) SendEmail(from string, recipients []string, data []
 	// Send MAIL FROM
 	if err := client.Mail(from); err != nil {
 		sendErr = err
-		return err
+		return "", err
 	}
 
 	// Send RCPT TO for each recipient
 	for _, rcpt := range recipients {
 		if err := client.Rcpt(rcpt); err != nil {
 			sendErr = err
-			return err
+			return "", err
 		}
 	}
 
-	// Send DATA
-	wc, err := client.Data()
+	// DATA with the reply text kept (same steps as net/smtp Client.Data + dataCloser.Close)
+	id, err := client.Text.Cmd("DATA")
 	if err != nil {
 		sendErr = err
-		return err
+		return "", err
 	}
-
-	// Write message data
+	client.Text.StartResponse(id)
+	_, _, err = client.Text.ReadResponse(354)
+	client.Text.EndResponse(id)
+	if err != nil {
+		sendErr = err
+		return "", err
+	}
+	wc := client.Text.DotWriter()
 	if _, err := wc.Write(data); err != nil {
 		wc.Close()
 		sendErr = err
-		return err
+		return "", err
 	}
-
-	// Close data writer
 	if err := wc.Close(); err != nil {
 		sendErr = err
-		return err
+		return "", err
 	}
-
-	return nil
+	_, reply, err := client.Text.ReadResponse(250)
+	if err != nil {
+		sendErr = err
+		return "", err
+	}
+	return reply, nil
 }

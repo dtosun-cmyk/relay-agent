@@ -287,7 +287,7 @@ func TestProcessEmail(t *testing.T) {
 		ReceivedAt: time.Now(),
 	}
 
-	filter.processEmail(msg)
+	filter.processEmail(msg, "")
 
 	// Should receive 2 emails (one per recipient)
 	timeout := time.After(2 * time.Second)

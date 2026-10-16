@@ -63,15 +63,60 @@ func NewMongoRepository(uri, dbName string, logger zerolog.Logger) (*MongoReposi
 	return repo, nil
 }
 
+// Queue ID index (v1.0.6). v1.0.5 had a unique SPARSE index on queue_id alone: sparse only skips documents
+// WITHOUT the field, but every record stored queue_id "" — one record still waiting for its delivery result
+// made every later "received" record fail with a duplicate key (the bulk write swallowed the error), and the
+// recipients of one message share one queue ID. Now: unique on (queue_id, recipient), only for non-empty
+// queue IDs (partial index).
+const (
+	legacyQueueIndex = "idx_queue_id"
+	queueIndexName   = "idx_queue_rcpt"
+)
+
+var queueIndexFilter = bson.D{{Key: "queue_id", Value: bson.D{{Key: "$type", Value: "string"}, {Key: "$gt", Value: ""}}}}
+
+// migrateQueueIndex drops the v1.0.5 index, removes stored empty queue IDs and creates the partial unique
+// index. Best effort: an error is logged, the agent keeps running (Postfix depends on the SMTP filter; with
+// omitempty, new records no longer store "" even if the old index stays).
+func (r *MongoRepository) migrateQueueIndex(ctx context.Context) {
+	cur, err := r.emails.Indexes().List(ctx)
+	if err == nil {
+		var specs []bson.M
+		if err = cur.All(ctx, &specs); err == nil {
+			for _, sp := range specs {
+				if sp["name"] == legacyQueueIndex {
+					if _, derr := r.emails.Indexes().DropOne(ctx, legacyQueueIndex); derr != nil {
+						r.logger.Error().Err(derr).Msg("queue index migration: could not drop idx_queue_id")
+					} else {
+						r.logger.Info().Msg("queue index migration: dropped idx_queue_id (unique sparse on queue_id)")
+					}
+				}
+			}
+		}
+	}
+	if err != nil {
+		r.logger.Error().Err(err).Msg("queue index migration: could not list indexes")
+	}
+	if res, uerr := r.emails.UpdateMany(ctx, bson.M{"queue_id": ""}, bson.M{"$unset": bson.M{"queue_id": ""}}); uerr != nil {
+		r.logger.Error().Err(uerr).Msg("queue index migration: could not remove empty queue IDs")
+	} else if res.ModifiedCount > 0 {
+		r.logger.Info().Int64("records", res.ModifiedCount).Msg("queue index migration: removed empty queue IDs")
+	}
+	_, err = r.emails.Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys: bson.D{{Key: "queue_id", Value: 1}, {Key: "recipient", Value: 1}},
+		Options: options.Index().SetUnique(true).SetName(queueIndexName).
+			SetPartialFilterExpression(queueIndexFilter),
+	})
+	if err != nil {
+		r.logger.Error().Err(err).Msg("queue index migration: could not create idx_queue_rcpt")
+	}
+}
+
 // EnsureIndexes creates all necessary indexes for optimal query performance
 func (r *MongoRepository) EnsureIndexes(ctx context.Context) error {
+	r.migrateQueueIndex(ctx)
+
 	indexes := []mongo.IndexModel{
-		// Unique sparse index on queue_id for fast lookups
-		// Sparse allows multiple documents with missing/null queue_id without duplicate key errors
-		{
-			Keys:    bson.D{{Key: "queue_id", Value: 1}},
-			Options: options.Index().SetUnique(true).SetSparse(true).SetName("idx_queue_id"),
-		},
 		// Index on mailgateway_queue_id for webhook correlation
 		{
 			Keys:    bson.D{{Key: "mailgateway_queue_id", Value: 1}},
@@ -207,39 +252,7 @@ func (r *MongoRepository) UpsertByMailgatewayQueueID(ctx context.Context, email 
 		return fmt.Errorf("mailgateway_queue_id is required for upsert")
 	}
 
-	filter := bson.M{"mailgateway_queue_id": email.MailgatewayQueueID}
-
-	// Build update document:
-	// - $set: Delivery-related fields from log parser (relay info, status, etc.)
-	// - $setOnInsert: Original client info from filter (mailgateway source)
-	update := bson.M{
-		"$set": bson.M{
-			"queue_id":         email.QueueID,
-			"status":           email.Status,
-			"dsn":              email.DSN,
-			"status_message":   email.StatusMessage,
-			"delivery_time_ms": email.DeliveryTimeMs,
-			"delivered_at":     email.DeliveredAt,
-			"provider":         email.Provider,
-			"attempts":         email.Attempts,
-			"created_at":       email.CreatedAt,
-			"relay_host":       email.RelayHost, // Destination relay (from log parser)
-			"relay_ip":         email.RelayIP,   // Destination relay IP (from log parser)
-		},
-		"$setOnInsert": bson.M{
-			// These fields are only set if this is a new insert (not an update)
-			// This preserves original mailgateway info (from XFORWARD) and ReceivedAt
-			"sender":               email.Sender,
-			"recipient":            email.Recipient,
-			"recipient_domain":     email.RecipientDomain,
-			"size":                 email.Size,
-			"received_at":          email.ReceivedAt,
-			"client_host":          email.ClientHost, // Mailgateway hostname (source)
-			"client_ip":            email.ClientIP,   // Mailgateway IP (source)
-			"webhook_sent":         false,
-			"mailgateway_queue_id": email.MailgatewayQueueID,
-		},
-	}
+	filter, update := upsertModel(email)
 
 	opts := options.Update().SetUpsert(true)
 
@@ -264,6 +277,44 @@ func (r *MongoRepository) UpsertByMailgatewayQueueID(ctx context.Context, email 
 	return nil
 }
 
+// upsertModel builds the filter and update of one record. A record is one recipient of one message:
+// (mailgateway_queue_id, recipient). v1.0.5 used mailgateway_queue_id alone, so all recipients of a message
+// collapsed into one document. queue_id is set only when known (never "").
+func upsertModel(email *Email) (bson.M, bson.M) {
+	filter := bson.M{"mailgateway_queue_id": email.MailgatewayQueueID, "recipient": email.Recipient}
+	set := bson.M{
+		"status":           email.Status,
+		"dsn":              email.DSN,
+		"status_message":   email.StatusMessage,
+		"delivery_time_ms": email.DeliveryTimeMs,
+		"delivered_at":     email.DeliveredAt,
+		"provider":         email.Provider,
+		"attempts":         email.Attempts,
+		"created_at":       email.CreatedAt,
+		"relay_host":       email.RelayHost, // Destination relay (from log parser)
+		"relay_ip":         email.RelayIP,   // Destination relay IP (from log parser)
+		"updated_at":       util.NowTurkey(),
+	}
+	if email.QueueID != "" {
+		set["queue_id"] = email.QueueID
+	}
+	update := bson.M{
+		"$set": set,
+		// only on insert: the original mailgateway info (XFORWARD) and ReceivedAt
+		// (mailgateway_queue_id and recipient come from the filter)
+		"$setOnInsert": bson.M{
+			"sender":           email.Sender,
+			"recipient_domain": email.RecipientDomain,
+			"size":             email.Size,
+			"received_at":      email.ReceivedAt,
+			"client_host":      email.ClientHost, // Mailgateway hostname (source)
+			"client_ip":        email.ClientIP,   // Mailgateway IP (source)
+			"webhook_sent":     false,
+		},
+	}
+	return filter, update
+}
+
 // BulkUpsertByMailgatewayQueueID performs bulk upsert operations for better performance
 // Instead of individual upserts, this batches all operations into a single MongoDB call
 func (r *MongoRepository) BulkUpsertByMailgatewayQueueID(ctx context.Context, emails []*Email) error {
@@ -277,43 +328,8 @@ func (r *MongoRepository) BulkUpsertByMailgatewayQueueID(ctx context.Context, em
 		if email.MailgatewayQueueID == "" {
 			continue
 		}
-
-		filter := bson.M{"mailgateway_queue_id": email.MailgatewayQueueID}
-
-		update := bson.M{
-			"$set": bson.M{
-				"queue_id":         email.QueueID,
-				"status":           email.Status,
-				"dsn":              email.DSN,
-				"status_message":   email.StatusMessage,
-				"delivery_time_ms": email.DeliveryTimeMs,
-				"delivered_at":     email.DeliveredAt,
-				"provider":         email.Provider,
-				"attempts":         email.Attempts,
-				"created_at":       email.CreatedAt,
-				"relay_host":       email.RelayHost,
-				"relay_ip":         email.RelayIP,
-				"updated_at":       util.NowTurkey(),
-			},
-			"$setOnInsert": bson.M{
-				"sender":               email.Sender,
-				"recipient":            email.Recipient,
-				"recipient_domain":     email.RecipientDomain,
-				"size":                 email.Size,
-				"received_at":          email.ReceivedAt,
-				"client_host":          email.ClientHost,
-				"client_ip":            email.ClientIP,
-				"webhook_sent":         false,
-				"mailgateway_queue_id": email.MailgatewayQueueID,
-			},
-		}
-
-		operation := mongo.NewUpdateOneModel().
-			SetFilter(filter).
-			SetUpdate(update).
-			SetUpsert(true)
-
-		operations = append(operations, operation)
+		filter, update := upsertModel(email)
+		operations = append(operations, mongo.NewUpdateOneModel().SetFilter(filter).SetUpdate(update).SetUpsert(true))
 	}
 
 	if len(operations) == 0 {
@@ -324,13 +340,27 @@ func (r *MongoRepository) BulkUpsertByMailgatewayQueueID(ctx context.Context, em
 	result, err := r.emails.BulkWrite(ctx, operations, opts)
 
 	if err != nil {
-		// Check for partial failures
+		// Partial failure: the other records of the batch were written. v1.0.5 logged this as a warning
+		// without the reason, which hid the duplicate-key loss; log every failed record (v1.0.6).
 		if bulkErr, ok := err.(mongo.BulkWriteException); ok {
-			r.logger.Warn().
-				Int64("upserted", result.UpsertedCount).
-				Int64("modified", result.ModifiedCount).
+			var upserted, modified int64
+			if result != nil {
+				upserted, modified = result.UpsertedCount, result.ModifiedCount
+			}
+			for _, we := range bulkErr.WriteErrors {
+				ev := r.logger.Error().Int("code", we.Code).Str("error", we.Message)
+				if we.Index >= 0 && we.Index < len(operations) {
+					if m, ok := operations[we.Index].(*mongo.UpdateOneModel); ok {
+						ev = ev.Interface("filter", m.Filter)
+					}
+				}
+				ev.Msg("record not written")
+			}
+			r.logger.Error().
+				Int64("upserted", upserted).
+				Int64("modified", modified).
 				Int("errors", len(bulkErr.WriteErrors)).
-				Msg("Bulk upsert completed with some errors")
+				Msg("Bulk upsert completed with errors")
 			return nil
 		}
 		return fmt.Errorf("bulk upsert failed: %w", err)
@@ -385,6 +415,10 @@ func (r *MongoRepository) UpdateByQueueID(ctx context.Context, email *Email) (st
 		"queue_id":             email.QueueID,
 		"mailgateway_queue_id": bson.M{"$ne": ""},
 	}
+	if email.Recipient != "" {
+		// the recipients of one message share its queue ID (v1.0.6)
+		filter["recipient"] = email.Recipient
+	}
 	set := bson.M{
 		"status":           email.Status,
 		"dsn":              email.DSN,
@@ -412,19 +446,24 @@ func (r *MongoRepository) UpdateByQueueID(ctx context.Context, email *Email) (st
 	return updated.MailgatewayQueueID, nil
 }
 
+// RecipientMatchWindow: how far back UpdateByRecipientMatch looks (Postfix maximal_queue_lifetime default)
+const RecipientMatchWindow = 5 * 24 * time.Hour
+
 // UpdateByRecipientMatch finds a recent "received" record matching recipient+sender
 // and updates it with delivery info. Used when mailgateway_queue_id is not available
 // (e.g., reinjected emails from content_filter).
 // Returns the mailgateway_queue_id if a match was found and updated.
 func (r *MongoRepository) UpdateByRecipientMatch(ctx context.Context, email *Email) (string, error) {
-	// Find a "received" record with same recipient+sender from last 10 minutes
-	// Extended timeout to handle deferred emails that retry later
-	cutoff := util.NowTurkey().Add(-10 * time.Minute)
+	// Fallback only (v1.0.6): records whose relay queue ID the filter could not read. v1.0.5 matched only the
+	// last 10 minutes, so a delivery that took longer (17.8 min measured) left the record "received" forever.
+	// The window is Postfix's default maximal_queue_lifetime; the oldest unmatched record is taken first.
+	cutoff := util.NowTurkey().Add(-RecipientMatchWindow)
 
 	filter := bson.M{
 		"recipient":            email.Recipient,
 		"sender":               email.Sender,
 		"status":               "received",
+		"queue_id":             bson.M{"$exists": false},
 		"mailgateway_queue_id": bson.M{"$ne": ""}, // Must have mailgateway_queue_id
 		"received_at":          bson.M{"$gte": cutoff},
 	}
@@ -446,7 +485,7 @@ func (r *MongoRepository) UpdateByRecipientMatch(ctx context.Context, email *Ema
 	}
 
 	// Use FindOneAndUpdate to get the mailgateway_queue_id
-	opts := options.FindOneAndUpdate().SetReturnDocument(options.After)
+	opts := options.FindOneAndUpdate().SetReturnDocument(options.After).SetSort(bson.D{{Key: "received_at", Value: 1}})
 	var updatedEmail Email
 	err := r.emails.FindOneAndUpdate(ctx, filter, update, opts).Decode(&updatedEmail)
 

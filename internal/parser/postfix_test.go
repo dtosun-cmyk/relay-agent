@@ -201,9 +201,9 @@ func TestProviderDetection(t *testing.T) {
 		{"me.com", "Apple"},
 		{"mac.com", "Apple"},
 		{"aol.com", "AOL"},
-		{"company.com", "Company"},
-		{"example.org", "Example"},
-		{"test.net", "Test"},
+		{"company.com", ""}, // v1.0.6: a domain name is not a provider name
+		{"example.org", ""},
+		{"aksuhome.com", ""},
 	}
 
 	for _, tt := range tests {
@@ -513,5 +513,33 @@ func BenchmarkParseDelay(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		_ = parser.parseDelay(delay)
+	}
+}
+
+
+// v1.0.6: the provider label comes from the destination MX host (same suffixes as the main server).
+func TestProviderFor(t *testing.T) {
+	p := NewParser(make(chan *repository.Email, 1))
+	cases := []struct{ host, domain, want string }{
+		{"mx01.mail.icloud.com", "icloud.com", "Apple"},
+		{"mx02.mail.icloud.com.", "mac.com", "Apple"},
+		{"gmail-smtp-in.l.google.com", "gmail.com", "Gmail"},
+		{"aspmx.l.google.com", "firma.com.tr", "Gmail"},
+		{"tepehome-com-tr.mail.protection.outlook.com", "tepehome.com.tr", "Outlook"},
+		{"hotmail-com.olc.protection.outlook.com", "hotmail.com", "Outlook"},
+		{"mx-aol.mail.gm0.yahoodns.net", "aol.com", "Yahoo"},
+		{"mx.yandex.ru", "yandex.com", "Yandex"},
+		{"mail.protonmail.ch", "proton.me", "ProtonMail"},
+		{"mxs.mail.ru", "mail.ru", "MailRu"},
+		{"mx01.vargonen.net", "aksuhome.com", "Other"},
+		{"mail.rusfishcom.ru", "rusfishcom.ru", "Other"},
+		{"mx.notgoogle.com", "x.com", "Other"},
+		{"", "gmail.com", "Gmail"},    // no connection yet: the provider's own domain
+		{"", "aksuhome.com", "Other"}, // not a provider name
+	}
+	for _, c := range cases {
+		if got := p.providerFor(c.host, c.domain); got != c.want {
+			t.Errorf("providerFor(%q, %q) = %q, want %q", c.host, c.domain, got, c.want)
+		}
 	}
 }

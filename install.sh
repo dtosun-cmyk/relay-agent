@@ -507,6 +507,11 @@ EOF
 AGENT_TLS_DIR="${INSTALL_DIR}/tls"
 mkdir -p "$AGENT_TLS_DIR"
 chmod 755 "$AGENT_TLS_DIR"
+# Extended key usage serverAuth AND clientAuth (v1.0.6): mongod also uses this certificate as a TLS CLIENT
+# (its own connections to itself, e.g. the commit vote of a replica-set index build). With serverAuth only
+# mongod refused itself ("unsuitable certificate purpose"), and an index build on a non-empty collection never
+# finished. An existing certificate without clientAuth is re-issued from the SAME key (Mail Gateway takes the
+# new certificate from the result block below and pins it again).
 if [ ! -s "$AGENT_TLS_DIR/agent.crt" ] || [ ! -s "$AGENT_TLS_DIR/agent.key" ]; then
     log_info "Agent TLS sertifikasi olusturuluyor (API + MongoDB)..."
     openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 3650 \
@@ -515,7 +520,19 @@ if [ ! -s "$AGENT_TLS_DIR/agent.crt" ] || [ ! -s "$AGENT_TLS_DIR/agent.key" ]; t
         -addext "subjectAltName=IP:${SERVER_IP},DNS:${DOMAIN},DNS:localhost,IP:127.0.0.1" \
         -addext "basicConstraints=critical,CA:TRUE" \
         -addext "keyUsage=critical,digitalSignature,keyEncipherment,keyCertSign" \
-        -addext "extendedKeyUsage=serverAuth" >/dev/null 2>&1 || { log_error "Agent TLS sertifikasi olusturulamadi"; exit 1; }
+        -addext "extendedKeyUsage=serverAuth,clientAuth" >/dev/null 2>&1 || { log_error "Agent TLS sertifikasi olusturulamadi"; exit 1; }
+elif ! openssl x509 -in "$AGENT_TLS_DIR/agent.crt" -noout -ext extendedKeyUsage 2>/dev/null | grep -q "Client Authentication"; then
+    log_warn "Agent TLS sertifikasinda istemci kullanimi (clientAuth) yok: ayni anahtarla yeniden uretiliyor"
+    cp -p "$AGENT_TLS_DIR/agent.crt" "$AGENT_TLS_DIR/agent.crt.serverauth-only.$(date +%Y%m%d%H%M%S)"
+    openssl req -x509 -new -key "$AGENT_TLS_DIR/agent.key" -sha256 -days 3650 \
+        -out "$AGENT_TLS_DIR/agent.crt.new" \
+        -subj "/CN=${DOMAIN}/O=relay-agent" \
+        -addext "subjectAltName=IP:${SERVER_IP},DNS:${DOMAIN},DNS:localhost,IP:127.0.0.1" \
+        -addext "basicConstraints=critical,CA:TRUE" \
+        -addext "keyUsage=critical,digitalSignature,keyEncipherment,keyCertSign" \
+        -addext "extendedKeyUsage=serverAuth,clientAuth" >/dev/null 2>&1 \
+        && mv -f "$AGENT_TLS_DIR/agent.crt.new" "$AGENT_TLS_DIR/agent.crt" \
+        || { log_error "Agent TLS sertifikasi yeniden uretilemedi"; exit 1; }
 fi
 chmod 600 "$AGENT_TLS_DIR/agent.key"
 chmod 644 "$AGENT_TLS_DIR/agent.crt"

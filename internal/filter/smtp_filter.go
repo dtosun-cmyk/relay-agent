@@ -457,15 +457,17 @@ func (s *smtpSession) handleData() error {
 	// Parse headers
 	s.filter.parseHeaders(s.msg)
 
-	// Process email (send to MongoDB)
-	s.filter.processEmail(s.msg)
-
-	// Forward to next hop
-	if err := s.filter.forwardEmail(s.msg); err != nil {
+	// Forward to next hop first: the records are written only for an accepted message and carry the queue ID
+	// the next hop gave it (v1.0.6; before, a 451 left a "received" record that never completed)
+	relayQueueID, err := s.filter.forwardEmail(s.msg)
+	if err != nil {
 		s.logger.Error().Err(err).Msg("failed to forward email")
 		s.filter.errors.Add(1)
 		return s.writeLine(smtpTempError, "Failed to forward message")
 	}
+
+	// Process email (send to MongoDB)
+	s.filter.processEmail(s.msg, relayQueueID)
 
 	s.filter.received.Add(1)
 	s.filter.forwarded.Add(1)
@@ -776,13 +778,15 @@ func (f *SMTPFilter) parseHeaders(msg *EmailMessage) {
 	}
 }
 
-// processEmail sends email info to MongoDB via channel.
-func (f *SMTPFilter) processEmail(msg *EmailMessage) {
+// processEmail sends email info to MongoDB via channel. relayQueueID = the queue ID the next hop gave the
+// message ("" when its reply had none: the delivery result is then matched by sender + recipient).
+func (f *SMTPFilter) processEmail(msg *EmailMessage, relayQueueID string) {
 	// Create Email records for each recipient
 	for _, recipient := range msg.Recipients {
 		email := repository.GetEmail()
 
 		email.ID = primitive.NewObjectID()
+		email.QueueID = relayQueueID
 		email.MailgatewayQueueID = msg.QueueID
 		email.Sender = msg.From
 		email.Recipient = recipient
@@ -821,21 +825,26 @@ func (f *SMTPFilter) processEmail(msg *EmailMessage) {
 
 // forwardEmail forwards the email to the next hop (Postfix on port 10026).
 // Uses connection pool for improved performance.
-func (f *SMTPFilter) forwardEmail(msg *EmailMessage) error {
+func (f *SMTPFilter) forwardEmail(msg *EmailMessage) (string, error) {
 	// Use connection pool to send email
-	err := f.connPool.SendEmail(msg.From, msg.Recipients, msg.Data)
+	reply, err := f.connPool.SendEmail(msg.From, msg.Recipients, msg.Data)
 	if err != nil {
-		return fmt.Errorf("failed to forward via pool: %w", err)
+		return "", fmt.Errorf("failed to forward via pool: %w", err)
 	}
+	relayQueueID := QueueIDFromReply(reply)
 
-	f.logger.Info().
-		Str("queue_id", msg.QueueID).
+	ev := f.logger.Info()
+	if relayQueueID == "" {
+		ev = f.logger.Warn().Str("reply", reply)
+	}
+	ev.Str("queue_id", msg.QueueID).
+		Str("relay_queue_id", relayQueueID).
 		Str("from", msg.From).
 		Int("recipients", len(msg.Recipients)).
 		Int64("size", msg.Size).
 		Msg("email forwarded")
 
-	return nil
+	return relayQueueID, nil
 }
 
 // Stats returns current filter statistics.

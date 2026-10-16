@@ -296,7 +296,7 @@ func BenchmarkEmailProcessing(b *testing.B) {
 		b.ResetTimer()
 
 		for i := 0; i < b.N; i++ {
-			filter.processEmail(msg)
+			filter.processEmail(msg, "")
 		}
 	})
 
@@ -318,7 +318,7 @@ func BenchmarkEmailProcessing(b *testing.B) {
 		b.ResetTimer()
 
 		for i := 0; i < b.N; i++ {
-			filter.processEmail(msg)
+			filter.processEmail(msg, "")
 		}
 	})
 }

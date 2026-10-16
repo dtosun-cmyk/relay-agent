@@ -271,7 +271,7 @@ func (p *Parser) processSmtp(entry *repository.LogEntry, line string) {
 	if recipient, ok := extractAngleBracket(line, "to="); ok && recipient != "" {
 		entry.Recipient = recipient
 		entry.RecipientDomain = p.extractDomain(recipient)
-		entry.Provider = p.detectProvider(entry.RecipientDomain)
+		entry.Provider = p.providerFor(entry.RelayHost, entry.RecipientDomain)
 	}
 
 	// Extract delay: "delay=2.1"
@@ -369,35 +369,61 @@ func (p *Parser) finalize(entry *repository.LogEntry) {
 // Uses pre-populated provider map for fast lookup.
 // Falls back to capitalizing the domain name for unknown providers.
 // Zero-allocation for known providers (99%+ of cases).
+// mxProviderSuffixes: destination MX host suffix -> provider label (v1.0.6). Same suffixes as the main
+// server's provider detection (policy-engine provider_match.go, verified from 30 days of deliveries):
+// the provider is the destination's mail service, read from the MX host this relay delivered to.
+var mxProviderSuffixes = []struct{ suffix, dotted, provider string }{
+	{"mail.icloud.com", ".mail.icloud.com", "Apple"},
+	{"googlemail.com", ".googlemail.com", "Gmail"},
+	{"protonmail.ch", ".protonmail.ch", "ProtonMail"},
+	{"yahoodns.net", ".yahoodns.net", "Yahoo"},
+	{"outlook.com", ".outlook.com", "Outlook"},
+	{"hotmail.com", ".hotmail.com", "Outlook"},
+	{"google.com", ".google.com", "Gmail"},
+	{"yandex.net", ".yandex.net", "Yandex"},
+	{"yandex.ru", ".yandex.ru", "Yandex"},
+	{"mail.ru", ".mail.ru", "MailRu"},
+}
+
+// providerFromMXHost returns the provider label of a destination MX host ("" when not a known provider).
+func providerFromMXHost(host string) string {
+	h := strings.TrimSuffix(strings.ToLower(host), ".")
+	if h == "" {
+		return ""
+	}
+	for i := range mxProviderSuffixes {
+		if h == mxProviderSuffixes[i].suffix || strings.HasSuffix(h, mxProviderSuffixes[i].dotted) {
+			return mxProviderSuffixes[i].provider
+		}
+	}
+	return ""
+}
+
+// providerFor: the provider from the destination MX host; without a host (no connection yet) the
+// provider's own domain (exact, e.g. gmail.com); otherwise "Other". v1.0.5 turned any domain into a
+// provider name ("aksuhome.com" -> "Aksuhome").
+func (p *Parser) providerFor(relayHost, domain string) string {
+	if prov := providerFromMXHost(relayHost); prov != "" {
+		return prov
+	}
+	if relayHost == "" {
+		if prov, ok := p.providerMap[strings.ToLower(domain)]; ok {
+			return prov
+		}
+	}
+	return "Other"
+}
+
+// detectProvider returns the provider of a provider's own domain (exact; "" for any other domain).
 func (p *Parser) detectProvider(domain string) string {
 	if domain == "" {
 		return ""
 	}
 
-	// Fast path: known provider (zero-alloc)
 	if provider, ok := p.providerMap[domain]; ok {
 		return provider
 	}
-
-	// Slow path: capitalize domain name (e.g., "company.com" -> "Company")
-	dotIdx := strings.IndexByte(domain, '.')
-	if dotIdx <= 0 {
-		return domain
-	}
-
-	// Direct []byte manipulation - single allocation for result string only
-	domainPart := domain[:dotIdx]
-	if len(domainPart) == 0 {
-		return domain
-	}
-
-	// Allocate exact-size byte slice
-	result := make([]byte, len(domainPart))
-	copy(result, domainPart)
-	if result[0] >= 'a' && result[0] <= 'z' {
-		result[0] -= 32
-	}
-	return string(result)
+	return ""
 }
 
 // extractDomain extracts the domain from an email address.

@@ -63,13 +63,21 @@ func main() {
 		}
 	}()
 
-	// Ensure MongoDB indexes
-	logger.Info().Msg("Ensuring MongoDB indexes")
-	indexCtx, indexCancel := context.WithTimeout(ctx, 30*time.Second)
-	defer indexCancel()
-	if err := repo.EnsureIndexes(indexCtx); err != nil {
-		logger.Fatal().Err(err).Msg("Failed to ensure MongoDB indexes")
-	}
+	// Ensure MongoDB indexes in the background (v1.0.6): Postfix hands every mail to the SMTP filter, so the
+	// agent must start even when MongoDB cannot finish an index build right away. On a replica set an index
+	// build on a non-empty collection waits for its commit vote; a mongod whose outgoing (self) TLS connection
+	// is refused never sends it, the build never finishes, and v1.0.5's synchronous call + Fatal kept the agent
+	// (and the relay's mail) down. The records are written without the index meanwhile.
+	go func() {
+		logger.Info().Msg("Ensuring MongoDB indexes (background)")
+		indexCtx, indexCancel := context.WithTimeout(ctx, 30*time.Minute)
+		defer indexCancel()
+		if err := repo.EnsureIndexes(indexCtx); err != nil {
+			logger.Error().Err(err).Msg("Failed to ensure MongoDB indexes (the agent keeps running)")
+			return
+		}
+		logger.Info().Msg("MongoDB indexes ensured")
+	}()
 
 	// Create buffered channels
 	lineChan := make(chan string, cfg.Processing.ChannelBuffer)
